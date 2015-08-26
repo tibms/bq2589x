@@ -1220,12 +1220,6 @@ static int bq2589x_charger_probe(struct i2c_client *client,
 	}
 
 	bq->batt_psy = power_supply_get_by_name("battery");
-	if (!bq->batt_psy) {
-		dev_err(bq->dev, "battery supply not found, deferring probe\n");
-		return -EPROBE_DEFER;
-	}
-
-	bq->batt_psy = power_supply_get_by_name("battery");
 
 	g_bq = bq;
 
