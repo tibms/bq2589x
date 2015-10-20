@@ -52,6 +52,21 @@ enum bq2589x_part_no {
 
 #define BQ2589X_STATUS_EXIST		0x0100
 
+struct bq2589x_config {
+	bool	enable_auto_dpdm;
+/*	bool	enable_12v;*/
+
+	int		charge_voltage;
+	int		charge_current;
+
+	bool	enable_term;
+	int		term_current;
+
+	bool 	enable_ico;
+	bool	use_absolute_vindpm;
+};
+
+
 struct bq2589x {
 	struct device *dev;
 	struct i2c_client *client;
@@ -62,29 +77,19 @@ struct bq2589x {
 	int		vbus_type;
 
 	bool	enabled;
-	bool	use_absolute_vindpm;
-/*
-	int		charge_volt;
-	int		charge_current;
-*/
+
 	int		vbus_volt;
 	int		vbat_volt;
 
-	/* voltage level that expect adapter output after tune up*/
-	int		vbus_volt_high_level;
-	/* voltage level that expect adapter output after tune down*/
-	int		vbus_volt_low_level;
-	/* battery minimum voltage to tune up adapter*/
-	int		vbat_min_volt_to_tuneup;
-
 	int		rsoc;
+	struct	bq2589x_config	cfg;
 	struct work_struct irq_work;
 	struct work_struct adapter_in_work;
 	struct work_struct adapter_out_work;
 	struct delayed_work monitor_work;
 	struct delayed_work ico_work;
-	struct delayed_work volt_tune_work;
-	struct delayed_work check_to_tuneup_work;
+	struct delayed_work pe_volt_tune_work;
+	struct delayed_work check_pe_tuneup_work;
 
 	struct power_supply usb;
 	struct power_supply wall;
@@ -99,7 +104,11 @@ struct pe_ctrl {
 	bool tune_fail;
 	int  tune_count;
 	int  target_volt;
+	int	 high_volt_level;/* vbus volt > this threshold means tune up successfully */
+	int  low_volt_level; /* vbus volt < this threshold means tune down successfully */
+	int  vbat_min_volt;  /* to tune up voltage only when vbat > this threshold */
 };
+
 
 static struct bq2589x *g_bq;
 static struct pe_ctrl pe;
@@ -660,6 +669,74 @@ static int bq2589x_check_force_ico_done(struct bq2589x *bq)
 }
 EXPORT_SYMBOL_GPL(bq2589x_check_force_ico_done);
 
+static int bq2589x_enable_term(struct bq2589x* bq, bool enable)
+{
+	u8 val;
+	int ret;
+
+	if (enable)
+		val = BQ2589X_TERM_ENABLE << BQ2589X_EN_TERM_SHIFT;
+	else
+		val = BQ2589X_TERM_DISABLE << BQ2589X_EN_TERM_SHIFT;
+
+	ret = bq2589x_update_bits(bq, BQ2589X_REG_07, BQ2589X_EN_TERM_MASK, val);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(bq2589x_enable_term);
+
+static int bq2589x_enable_auto_dpdm(struct bq2589x* bq, bool enable)
+{
+	u8 val;
+	int ret;
+	
+	if (enable)
+		val = BQ2589X_AUTO_DPDM_ENABLE << BQ2589X_AUTO_DPDM_EN_SHIFT;
+	else
+		val = BQ2589X_AUTO_DPDM_DISABLE << BQ2589X_AUTO_DPDM_EN_SHIFT;
+
+	ret = bq2589x_update_bits(bq, BQ2589X_REG_02, BQ2589X_AUTO_DPDM_EN_MASK, val);
+
+	return ret;
+
+}
+EXPORT_SYMBOL_GPL(bq2589x_enable_auto_dpdm);
+
+static int bq2589x_use_absolute_vindpm(struct bq2589x* bq, bool enable)
+{
+	u8 val;
+	int ret;
+	
+	if (enable)
+		val = BQ2589X_FORCE_VINDPM_ENABLE << BQ2589X_FORCE_VINDPM_SHIFT;
+	else
+		val = BQ2589X_FORCE_VINDPM_DISABLE << BQ2589X_FORCE_VINDPM_SHIFT;
+
+	ret = bq2589x_update_bits(bq, BQ2589X_REG_0D, BQ2589X_FORCE_VINDPM_MASK, val);
+
+	return ret;
+
+}
+EXPORT_SYMBOL_GPL(bq2589x_use_absolute_vindpm);
+
+static int bq2589x_enable_ico(struct bq2589x* bq, bool enable)
+{
+	u8 val;
+	int ret;
+	
+	if (enable)
+		val = BQ2589X_ICO_ENABLE << BQ2589X_ICOEN_SHIFT;
+	else
+		val = BQ2589X_ICO_DISABLE << BQ2589X_ICOEN_SHIFT;
+
+	ret = bq2589x_update_bits(bq, BQ2589X_REG_02, BQ2589X_ICOEN_MASK, val);
+
+	return ret;
+
+}
+EXPORT_SYMBOL_GPL(bq2589x_enable_ico);
+
+
 static int bq2589x_read_idpm_limit(struct bq2589x *bq)
 {
 	uint8_t val;
@@ -702,20 +779,36 @@ static int bq2589x_init_device(struct bq2589x *bq)
 
 	bq2589x_disable_watchdog_timer(bq);
 
-	ret = bq2589x_set_term_current(bq, 256);
+	bq2589x_enable_auto_dpdm(bq, bq->cfg.enable_auto_dpdm);
+	bq2589x_enable_term(bq, bq->cfg.enable_term);
+	bq2589x_enable_ico(bq, bq->cfg.enable_ico);
+	/*force use absolute vindpm if auto_dpdm not enabled*/
+	if (!bq->cfg.enable_auto_dpdm)
+		bq->cfg.use_absolute_vindpm = true;
+	bq2589x_use_absolute_vindpm(bq, bq->cfg.use_absolute_vindpm);
+
+
+	ret = bq2589x_set_vindpm_offset(bq, 600);
+	if (ret < 0) {
+		dev_err(bq->dev, "%s:Failed to set vindpm offset:%d\n", __func__, ret);
+		return ret;
+	}
+
+	ret = bq2589x_set_term_current(bq, bq->cfg.term_current);
 	if (ret < 0) {
 		dev_err(bq->dev, "%s:Failed to set termination current:%d\n", __func__, ret);
 		return ret;
 	}
-	ret = bq2589x_set_chargevoltage(bq, 4208);
+
+	ret = bq2589x_set_chargevoltage(bq, bq->cfg.charge_voltage);
 	if (ret < 0) {
 		dev_err(bq->dev, "%s:Failed to set charge voltage:%d\n", __func__, ret);
 		return ret;
 	}
 
-	ret = bq2589x_set_vindpm_offset(bq, 600);
+	ret = bq2589x_set_chargecurrent(bq, bq->cfg.charge_current);
 	if (ret < 0) {
-		dev_err(bq->dev, "%s:Failed to set vindpm offset:%d\n", __func__, ret);
+		dev_err(bq->dev, "%s:Failed to set charge current:%d\n", __func__, ret);
 		return ret;
 	}
 
@@ -733,11 +826,6 @@ static int bq2589x_init_device(struct bq2589x *bq)
 		return ret;
 	}
 
-	ret = bq2589x_set_chargecurrent(bq, 2250);
-	if (ret < 0) {
-		dev_err(bq->dev, "%s:Failed to set charger charge current:%d\n", __func__, ret);
-		return ret;
-	}
 	bq2589x_set_watchdog_timer(bq, 160);
 
 	return ret;
@@ -904,16 +992,33 @@ static int bq2589x_parse_dt(struct device *dev, struct bq2589x *bq)
 	int ret;
 	struct device_node *np = dev->of_node;
 
-	ret = of_property_read_u32(np, "ti,bq2589x,vbus-volt-high-level", &bq->vbus_volt_high_level);
+	ret = of_property_read_u32(np, "ti,bq2589x,vbus-volt-high-level", &pe.high_volt_level);
 	if (ret)
 		return ret;
 
-	ret = of_property_read_u32(np, "ti,bq2589x,vbus-volt-low-level", &bq->vbus_volt_low_level);
+	ret = of_property_read_u32(np, "ti,bq2589x,vbus-volt-low-level", &pe.low_volt_level);
 	if (ret)
 		return ret;
 
-	ret = of_property_read_u32(np, "ti,bq2589x,vbat-min-volt-to-tuneup", &bq->vbat_min_volt_to_tuneup);
-    if (ret)
+	ret = of_property_read_u32(np, "ti,bq2589x,vbat-min-volt-to-tuneup", &pe.vbat_min_volt);
+	if (ret)
+		return ret;
+
+	bq->cfg.enable_auto_dpdm = of_property_read_bool(np, "ti,bq2589x,enable-auto-dpdm");
+	bq->cfg.enable_term = of_property_read_bool(np, "ti,bq2589x,enable-termination");
+	bq->cfg.enable_ico = of_property_read_bool(np, "ti,bq2589x,enable-ico");
+	bq->cfg.use_absolute_vindpm = of_property_read_bool(np, "ti,bq2589x,use-absolute-vindpm");
+
+	ret = of_property_read_u32(np, "ti,bq2589x,charge-voltage",&bq->cfg.charge_voltage);
+	if (ret)
+		return ret;
+
+	ret = of_property_read_u32(np, "ti,bq2589x,charge-current",&bq->cfg.charge_current);
+	if (ret)
+		return ret;
+
+	ret = of_property_read_u32(np, "ti,bq2589x,term-current",&bq->cfg.term_current);
+	if (ret)
 		return ret;
 
 	return 0;
@@ -977,13 +1082,13 @@ static void bq2589x_adapter_in_workfunc(struct work_struct *work)
 		schedule_delayed_work(&bq->ico_work, 0);
 	} else if (bq->vbus_type == BQ2589X_VBUS_USB_DCP) {/* DCP, let's check if it is PE adapter*/
 		dev_info(bq->dev, "%s:usb dcp adapter plugged in\n", __func__);
-		schedule_delayed_work(&bq->check_to_tuneup_work, 0);
+		schedule_delayed_work(&bq->check_pe_tuneup_work, 0);
 	} else {
 		dev_info(bq->dev, "%s:other adapter plugged in,vbus_type is %d\n", __func__, bq->vbus_type);
 		schedule_delayed_work(&bq->ico_work, 0);
 	}
 
-	if (bq->use_absolute_vindpm)
+	if (bq->cfg.use_absolute_vindpm)
 		bq2589x_adjust_absolute_vindpm(bq);
 
 	schedule_delayed_work(&bq->monitor_work, 0);
@@ -1002,6 +1107,7 @@ static void bq2589x_ico_workfunc(struct work_struct *work)
 {
 	struct bq2589x *bq = container_of(work, struct bq2589x, ico_work.work);
 	int ret;
+	int idpm;
 	u8 status;
 	static bool ico_issued;
 
@@ -1012,8 +1118,10 @@ static void bq2589x_ico_workfunc(struct work_struct *work)
 			schedule_delayed_work(&bq->ico_work, 2 * HZ);
 			return;
 		}
-		if (status & (BQ2589X_VDPM_STAT_MASK | BQ2589X_IDPM_STAT_MASK)) /*VINDPM or IINDPM*/
+		if (status & (BQ2589X_VDPM_STAT_MASK | BQ2589X_IDPM_STAT_MASK)) { /*VINDPM or IINDPM*/
+			dev_info(bq->dev, "%s:ICO omitted due to VINDPM or IINDPM:0x%02x",__func__,status);
 			return;
+		}
 		ret = bq2589x_force_ico(bq);
 		if (ret < 0) {
 			schedule_delayed_work(&bq->ico_work, HZ); /* retry 1 second later*/
@@ -1026,36 +1134,48 @@ static void bq2589x_ico_workfunc(struct work_struct *work)
 	} else {
 		ico_issued = false;
 		ret = bq2589x_check_force_ico_done(bq);
-		if (ret)/*ico done*/
-			dev_info(bq->dev, "%s:ICO done!\n", __func__);
+		if (ret) {/*ico done*/
+			ret = bq2589x_read_byte(bq, &status, BQ2589X_REG_13);
+			if (ret == 0) {
+				idpm = ((status & BQ2589X_IDPM_LIM_MASK) >> BQ2589X_IDPM_LIM_SHIFT) * BQ2589X_IDPM_LIM_LSB + BQ2589X_IDPM_LIM_BASE;
+				dev_info(bq->dev, "%s:ICO done, result is:%d mA\n", __func__, idpm);
+			}
+		}
 	}
 }
 
-static void bq2589x_check_if_tuneup_workfunc(struct work_struct *work)
+static void bq2589x_check_pe_tuneup_workfunc(struct work_struct *work)
 {
-	struct bq2589x *bq = container_of(work, struct bq2589x, check_to_tuneup_work.work);
+	struct bq2589x *bq = container_of(work, struct bq2589x, check_pe_tuneup_work.work);
+
+	if (!pe.enable) {
+		schedule_delayed_work(&bq->ico_work, 0);
+		return;
+	}
 
 	bq->vbat_volt = bq2589x_adc_read_battery_volt(bq);
+	bq->rsoc = bq2589x_read_batt_rsoc(bq); 
 
-	if (bq->vbat_volt > bq->vbat_min_volt_to_tuneup && bq->vbat_volt < 4100 /*bq->rsoc < 95*/) {
+	if (bq->vbat_volt > pe.vbat_min_volt && bq->rsoc < 95) {
 		dev_info(bq->dev, "%s:trying to tune up vbus voltage\n", __func__);
-		pe.target_volt = bq->vbus_volt_high_level;
+		pe.target_volt = pe.high_volt_level;
 		pe.tune_up_volt = true;
 		pe.tune_down_volt = false;
 		pe.tune_done = false;
 		pe.tune_count = 0;
 		pe.tune_fail = false;
-		schedule_delayed_work(&bq->volt_tune_work, 0);
-	} else if (bq->vbat_volt > 4100/*bq->rsoc >95*/) {
+		schedule_delayed_work(&bq->pe_volt_tune_work, 0);
+	} else if (bq->rsoc >= 95) {
 		schedule_delayed_work(&bq->ico_work, 0);
 	} else {
-		schedule_delayed_work(&bq->check_to_tuneup_work, 2*HZ);
+		/* wait battery voltage up enough to check again */
+		schedule_delayed_work(&bq->check_pe_tuneup_work, 2*HZ);
 	}
 }
 
 static void bq2589x_tune_volt_workfunc(struct work_struct *work)
 {
-	struct bq2589x *bq = container_of(work, struct bq2589x, volt_tune_work.work);
+	struct bq2589x *bq = container_of(work, struct bq2589x, pe_volt_tune_work.work);
 	int ret;
 	static bool pumpx_cmd_issued;
 
@@ -1089,12 +1209,12 @@ static void bq2589x_tune_volt_workfunc(struct work_struct *work)
 		else if (pe.tune_down_volt)
 			ret =  bq2589x_pumpx_decrease_volt(bq);
 		if (ret) {
-			schedule_delayed_work(&bq->volt_tune_work, HZ);
+			schedule_delayed_work(&bq->pe_volt_tune_work, HZ);
 		} else {
 			dev_info(bq->dev, "%s:pumpx command issued.\n", __func__);
 			pumpx_cmd_issued = true;
 			pe.tune_count++;
-			schedule_delayed_work(&bq->volt_tune_work, 3*HZ);
+			schedule_delayed_work(&bq->pe_volt_tune_work, 3*HZ);
 		}
 	} else {
 		if (pe.tune_up_volt)
@@ -1106,7 +1226,7 @@ static void bq2589x_tune_volt_workfunc(struct work_struct *work)
 			bq2589x_adjust_absolute_vindpm(bq);
 			pumpx_cmd_issued = 0;
 		}
-		schedule_delayed_work(&bq->volt_tune_work, HZ);
+		schedule_delayed_work(&bq->pe_volt_tune_work, HZ);
 	}
 }
 
@@ -1114,25 +1234,35 @@ static void bq2589x_tune_volt_workfunc(struct work_struct *work)
 static void bq2589x_monitor_workfunc(struct work_struct *work)
 {
 	struct bq2589x *bq = container_of(work, struct bq2589x, monitor_work.work);
+	u8 status = 0;
+	int ret;
+	int chg_current;
 
-	dev_info(bq->dev, "%s\n", __func__);
 	bq2589x_reset_watchdog_timer(bq);
 
 	bq->rsoc = bq2589x_read_batt_rsoc(bq);
 
 	bq->vbus_volt = bq2589x_adc_read_vbus_volt(bq);
 	bq->vbat_volt = bq2589x_adc_read_battery_volt(bq);
+	chg_current = bq2589x_adc_read_charge_current(bq);
 
+	dev_info(bq->dev, "%s:vbus volt:%d,vbat volt:%d,charge current:%d\n", __func__,bq->vbus_volt,bq->vbat_volt,chg_current);
 
-	if (bq->vbus_type == BQ2589X_VBUS_USB_DCP && bq->vbus_volt > bq->vbus_volt_high_level &&
+	ret = bq2589x_read_byte(bq, &status, BQ2589X_REG_13);
+	if (ret == 0 && (status & BQ2589X_VDPM_STAT_MASK))
+		dev_info(bq->dev, "%s:VINDPM occurred\n", __func__);
+	if (ret == 0 && (status & BQ2589X_IDPM_STAT_MASK))
+		dev_info(bq->dev, "%s:IINDPM occurred\n", __func__);
+		
+	if (bq->vbus_type == BQ2589X_VBUS_USB_DCP && bq->vbus_volt > pe.high_volt_level &&
 	    bq->rsoc > 95 && !pe.tune_down_volt) {
 		pe.tune_down_volt = true;
 		pe.tune_up_volt = false;
-		pe.target_volt = bq->vbus_volt_low_level;
+		pe.target_volt = pe.low_volt_level;
 		pe.tune_done = false;
 		pe.tune_count = 0;
 		pe.tune_fail = false;
-		schedule_delayed_work(&bq->volt_tune_work, 0);
+		schedule_delayed_work(&bq->pe_volt_tune_work, 0);
 	}
 
 	/* read temperature,or any other check if need to decrease charge current*/
@@ -1141,13 +1271,16 @@ static void bq2589x_monitor_workfunc(struct work_struct *work)
 }
 
 
+
 static void bq2589x_charger_irq_workfunc(struct work_struct *work)
 {
 	struct bq2589x *bq = container_of(work, struct bq2589x, irq_work);
 	u8 status = 0;
 	u8 fault = 0;
+	u8 charge_status = 0;
 	int ret;
 
+	msleep(5);
 
 	/* Read STATUS and FAULT registers */
 	ret = bq2589x_read_byte(bq, &status, BQ2589X_REG_0B);
@@ -1157,15 +1290,16 @@ static void bq2589x_charger_irq_workfunc(struct work_struct *work)
 	ret = bq2589x_read_byte(bq, &fault, BQ2589X_REG_0C);
 	if (ret)
 		return;
+	
+	bq->vbus_type = (status & BQ2589X_VBUS_STAT_MASK) >> BQ2589X_VBUS_STAT_SHIFT;
 
-	if ((((status & BQ2589X_VBUS_STAT_MASK) == 0) || ((status & BQ2589X_VBUS_STAT_MASK) == BQ2589X_VBUS_OTG))&& (bq->status & BQ2589X_STATUS_PLUGIN)) {
+	if (((bq->vbus_type == BQ2589X_VBUS_NONE) || (bq->vbus_type == BQ2589X_VBUS_OTG)) && (bq->status & BQ2589X_STATUS_PLUGIN)) {
 		dev_info(bq->dev, "%s:adapter removed\n", __func__);
 		bq->status &= ~BQ2589X_STATUS_PLUGIN;
 		schedule_work(&bq->adapter_out_work);
-	} else if ((status & BQ2589X_VBUS_STAT_MASK) != 0 && ((status & BQ2589X_VBUS_STAT_MASK) != BQ2589X_VBUS_OTG) && !(bq->status & BQ2589X_STATUS_PLUGIN)) {
+	} else if (bq->vbus_type != BQ2589X_VBUS_NONE && (bq->vbus_type != BQ2589X_VBUS_OTG) && !(bq->status & BQ2589X_STATUS_PLUGIN)) {
 		dev_info(bq->dev, "%s:adapter plugged in\n", __func__);
 		bq->status |= BQ2589X_STATUS_PLUGIN;
-		bq->vbus_type = (status & BQ2589X_VBUS_STAT_MASK) >> BQ2589X_VBUS_STAT_SHIFT;
 		schedule_work(&bq->adapter_in_work);
 	}
 
@@ -1179,6 +1313,19 @@ static void bq2589x_charger_irq_workfunc(struct work_struct *work)
 		bq->status |= BQ2589X_STATUS_FAULT;
 	else if (!fault && (bq->status & BQ2589X_STATUS_FAULT))
 		bq->status &= ~BQ2589X_STATUS_FAULT;
+
+	charge_status = (status & BQ2589X_CHRG_STAT_MASK) >> BQ2589X_CHRG_STAT_SHIFT;
+	if (charge_status == BQ2589X_CHRG_STAT_IDLE)
+		dev_info(bq->dev, "%s:not charging\n", __func__);
+	else if (charge_status == BQ2589X_CHRG_STAT_PRECHG)
+		dev_info(bq->dev, "%s:precharging\n", __func__);
+	else if (charge_status == BQ2589X_CHRG_STAT_FASTCHG)
+		dev_info(bq->dev, "%s:fast charging\n", __func__);
+	else if (charge_status == BQ2589X_CHRG_STAT_CHGDONE)
+		dev_info(bq->dev, "%s:charge done!\n", __func__);
+	
+	if (fault)
+		dev_info(bq->dev, "%s:charge fault:%02x\n", __func__,fault);
 }
 
 
@@ -1223,10 +1370,6 @@ static int bq2589x_charger_probe(struct i2c_client *client,
 
 	g_bq = bq;
 
-	bq->vbus_volt_high_level = 4400; /*by default adapter output 5v, if >4.4v,it is ok after tune up*/
-	bq->vbus_volt_low_level = 5500; /*by default adapter output 5v, if <5.5v,it is ok after tune down*/
-	bq->vbat_min_volt_to_tuneup = 3000; /* by default, tune up adapter output only when bat is >3000*/
-
 	if (client->dev.of_node)
 		bq2589x_parse_dt(&client->dev, bq);
 
@@ -1260,8 +1403,8 @@ static int bq2589x_charger_probe(struct i2c_client *client,
 	INIT_WORK(&bq->adapter_out_work, bq2589x_adapter_out_workfunc);
 	INIT_DELAYED_WORK(&bq->monitor_work, bq2589x_monitor_workfunc);
 	INIT_DELAYED_WORK(&bq->ico_work, bq2589x_ico_workfunc);
-	INIT_DELAYED_WORK(&bq->volt_tune_work, bq2589x_tune_volt_workfunc);
-	INIT_DELAYED_WORK(&bq->check_to_tuneup_work, bq2589x_check_if_tuneup_workfunc);
+	INIT_DELAYED_WORK(&bq->pe_volt_tune_work, bq2589x_tune_volt_workfunc);
+	INIT_DELAYED_WORK(&bq->check_pe_tuneup_work, bq2589x_check_pe_tuneup_workfunc);
 
 
 	ret = sysfs_create_group(&bq->dev->kobj, &bq2589x_attr_group);
@@ -1278,7 +1421,7 @@ static int bq2589x_charger_probe(struct i2c_client *client,
 		dev_info(bq->dev, "%s:irq = %d\n", __func__, client->irq);
 	}
 
-	pe.enable = true;
+	pe.enable = false;
 	schedule_work(&bq->irq_work);/*in case of adapter has been in when power off*/
 	return 0;
 
@@ -1288,8 +1431,8 @@ err_irq:
 	cancel_work_sync(&bq->adapter_out_work);
 	cancel_delayed_work_sync(&bq->monitor_work);
 	cancel_delayed_work_sync(&bq->ico_work);
-	cancel_delayed_work_sync(&bq->check_to_tuneup_work);
-	cancel_delayed_work_sync(&bq->volt_tune_work);
+	cancel_delayed_work_sync(&bq->check_pe_tuneup_work);
+	cancel_delayed_work_sync(&bq->pe_volt_tune_work);
 err_1:
 	gpio_free(GPIO_IRQ);
 err_0:
@@ -1311,8 +1454,8 @@ static void bq2589x_charger_shutdown(struct i2c_client *client)
 	cancel_work_sync(&bq->adapter_out_work);
 	cancel_delayed_work_sync(&bq->monitor_work);
 	cancel_delayed_work_sync(&bq->ico_work);
-	cancel_delayed_work_sync(&bq->check_to_tuneup_work);
-	cancel_delayed_work_sync(&bq->volt_tune_work);
+	cancel_delayed_work_sync(&bq->check_pe_tuneup_work);
+	cancel_delayed_work_sync(&bq->pe_volt_tune_work);
 
 	free_irq(bq->client->irq, NULL);
 	gpio_free(GPIO_IRQ);
@@ -1344,37 +1487,6 @@ static struct i2c_driver bq2589x_charger_driver = {
 };
 
 module_i2c_driver(bq2589x_charger_driver);
-
-/*
-static struct i2c_board_info __initdata i2c_bq2589x_charger[] = {
-	{
-		I2C_BOARD_INFO("bq2589x", 0x6A),
-	},
-};
-
-
-static int __init bq2589x_charger_init(void)
-{
-
-	i2c_register_board_info(0, i2c_bq2589x_charger, ARRAY_SIZE(i2c_bq2589x_charger));
-
-	if (i2c_add_driver(&bq2589x_charger_driver))
-		printk(KERN_INFO "%s, failed to register bq2589x_charger_driver.\n", __func__);
-	else
-		printk(KERN_INFO "%s, bq2589x_charger_driver register successfully!\n", __func__);
-
-	return 0;
-}
-
-static void __exit bq2589x_charger_exit(void)
-{
-	printk(KERN_INFO "%s:\n", __func__);
-	i2c_del_driver(&bq2589x_charger_driver);
-}
-
-module_init(bq2589x_charger_init);
-module_exit(bq2589x_charger_exit);
-*/
 
 MODULE_DESCRIPTION("TI BQ2589x Charger Driver");
 MODULE_LICENSE("GPL");
