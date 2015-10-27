@@ -1059,7 +1059,20 @@ static void bq2589x_adjust_absolute_vindpm(struct bq2589x *bq)
 	u16 vindpm_volt;
 	int ret;
 
+	ret = bq2589x_disable_charger(bq);	
+	if (ret < 0) {
+		dev_err(bq->dev,"%s:failed to disable charger\n",__func__);
+		/*return;*/
+	}
+	/* wait for new adc data */
+	msleep(1000);
 	vbus_volt = bq2589x_adc_read_vbus_volt(bq);
+	ret = bq2589x_enable_charger(bq);
+	if (ret < 0) {
+		dev_err(bq->dev, "%s:failed to enable charger\n",__func__);
+		return;
+	}
+
 	if (vbus_volt < 6000)
 		vindpm_volt = vbus_volt - 600;
 	else
@@ -1075,16 +1088,43 @@ static void bq2589x_adjust_absolute_vindpm(struct bq2589x *bq)
 static void bq2589x_adapter_in_workfunc(struct work_struct *work)
 {
 	struct bq2589x *bq = container_of(work, struct bq2589x, adapter_in_work);
-
+	int ret;
 
 	if (bq->vbus_type == BQ2589X_VBUS_MAXC) {
 		dev_info(bq->dev, "%s:HVDCP or Maxcharge adapter plugged in\n", __func__);
+		ret = bq2589x_set_chargecurrent(bq, bq->cfg.charge_current);
+		if (ret < 0) 
+			dev_err(bq->dev, "%s:Failed to set charge current:%d\n", __func__, ret);
+		else
+			dev_info(bq->dev, "%s: Set charge current to %dmA successfully\n",__func__,bq->cfg.charge_current);
 		schedule_delayed_work(&bq->ico_work, 0);
 	} else if (bq->vbus_type == BQ2589X_VBUS_USB_DCP) {/* DCP, let's check if it is PE adapter*/
 		dev_info(bq->dev, "%s:usb dcp adapter plugged in\n", __func__);
+		ret = bq2589x_set_chargecurrent(bq, bq->cfg.charge_current);
+		if (ret < 0) 
+			dev_err(bq->dev, "%s:Failed to set charge current:%d\n", __func__, ret);
+		else
+			dev_info(bq->dev, "%s: Set charge current to %dmA successfully\n",__func__,bq->cfg.charge_current);
 		schedule_delayed_work(&bq->check_pe_tuneup_work, 0);
-	} else {
+	} else if (bq->vbus_type == BQ2589X_VBUS_USB_SDP || bq->vbus_type == BQ2589X_VBUS_UNKNOWN) {
+		if (bq->vbus_type == BQ2589X_VBUS_USB_SDP)
+			dev_info(bq->dev, "%s:host SDP plugged in\n", __func__);
+		else
+			dev_info(bq->dev, "%s:unknown adapter plugged in\n", __func__);
+
+		ret = bq2589x_set_chargecurrent(bq, 500);
+		if (ret < 0) 
+			dev_err(bq->dev, "%s:Failed to set charge current:%d\n", __func__, ret);
+		else
+			dev_info(bq->dev, "%s: Set charge current to %dmA successfully\n",__func__,500);
+	}
+	else {	
 		dev_info(bq->dev, "%s:other adapter plugged in,vbus_type is %d\n", __func__, bq->vbus_type);
+		ret = bq2589x_set_chargecurrent(bq, 1000);
+		if (ret < 0) 
+			dev_err(bq->dev, "%s:Failed to set charge current:%d\n", __func__, ret);
+		else
+			dev_info(bq->dev, "%s: Set charge current to %dmA successfully\n",__func__,1000);
 		schedule_delayed_work(&bq->ico_work, 0);
 	}
 
@@ -1097,8 +1137,13 @@ static void bq2589x_adapter_in_workfunc(struct work_struct *work)
 static void bq2589x_adapter_out_workfunc(struct work_struct *work)
 {
 	struct bq2589x *bq = container_of(work, struct bq2589x, adapter_out_work);
+	int ret;
 
-	bq2589x_set_input_volt_limit(bq, 4400);
+	ret = bq2589x_set_input_volt_limit(bq, 4400);
+	if (ret < 0)
+		dev_err(bq->dev,"%s:reset vindpm threshold to 4400 failed:%d\n",__func__,ret);
+	else
+		dev_info(bq->dev,"%s:reset vindpm threshold to 4400 successfully\n",__func__);
 
 	cancel_delayed_work_sync(&bq->monitor_work);
 }
