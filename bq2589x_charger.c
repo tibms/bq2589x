@@ -1157,16 +1157,6 @@ static void bq2589x_ico_workfunc(struct work_struct *work)
 	static bool ico_issued;
 
 	if (!ico_issued) {
-		/* Read VINDPM/IINDPM status */
-		ret = bq2589x_read_byte(bq, &status, BQ2589X_REG_13);
-		if (ret < 0) {
-			schedule_delayed_work(&bq->ico_work, 2 * HZ);
-			return;
-		}
-		if (status & (BQ2589X_VDPM_STAT_MASK | BQ2589X_IDPM_STAT_MASK)) { /*VINDPM or IINDPM*/
-			dev_info(bq->dev, "%s:ICO omitted due to VINDPM or IINDPM:0x%02x",__func__,status);
-			return;
-		}
 		ret = bq2589x_force_ico(bq);
 		if (ret < 0) {
 			schedule_delayed_work(&bq->ico_work, HZ); /* retry 1 second later*/
